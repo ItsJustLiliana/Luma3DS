@@ -55,6 +55,7 @@ Menu rosalinaMenu = {
         { "System configuration...", MENU, .menu = &sysconfigMenu },
         { "Miscellaneous options...", MENU, .menu = &miscellaneousMenu },
         { "Save settings", METHOD, .method = &RosalinaMenu_SaveSettings },
+        { "Power off / reboot", METHOD, .method = &RosalinaMenu_PowerOffOrReboot },
         { "System info", METHOD, .method = &RosalinaMenu_ShowSystemInfo },
         { "Credits", METHOD, .method = &RosalinaMenu_ShowCredits },
         { "Debug info", METHOD, .method = &RosalinaMenu_ShowDebugInfo, .visibility = &rosalinaMenuShouldShowDebugInfo },
@@ -91,6 +92,42 @@ void RosalinaMenu_SaveSettings(void)
         Draw_Unlock();
     }
     while(!(waitInput() & KEY_B) && !menuShouldExit);
+}
+
+void RosalinaMenu_PowerOffOrReboot(void)
+{
+    Draw_Lock();
+    Draw_ClearFramebuffer();
+    Draw_FlushFramebuffer();
+    Draw_Unlock();
+
+    do
+    {
+        Draw_Lock();
+        Draw_DrawString(10, 10, COLOR_TITLE, "Power Off / Reboot");
+        Draw_DrawString(10, 30, COLOR_WHITE, "Press A to power off.\nPress Y to reboot.\nPress B to go back.");
+        Draw_FlushFramebuffer();
+        Draw_Unlock();
+
+        u32 pressed = waitInputWithTimeout(1000);
+
+        if(pressed & KEY_Y)
+        {
+            menuLeave();
+            APT_HardwareResetAsync();
+            return;
+        }
+        else if(pressed & KEY_A)
+        {
+            // Soft shutdown
+            menuLeave();
+            srvPublishToSubscriber(0x203, 0);
+            return;
+        }
+        else if(pressed & KEY_B)
+            return;
+    }
+    while(!menuShouldExit);
 }
 
 void RosalinaMenu_ShowSystemInfo(void)
@@ -265,7 +302,7 @@ static Result RosalinaMenu_WriteScreenshot(IFile *file, u32 width, bool top, boo
 
 void RosalinaMenu_TakeScreenshot(void)
 {
-    IFile file;
+    IFile file = {0};
     Result res = 0;
 
     char filename[64];
@@ -303,6 +340,11 @@ void RosalinaMenu_TakeScreenshot(void)
             res = 0;
         FSUSER_CloseArchive(archive);
     }
+    else
+    {
+        archive = 0;
+        goto end;
+    }
 
     dateTimeToString(dateTimeStr, osGetTime(), true);
 
@@ -326,6 +368,9 @@ void RosalinaMenu_TakeScreenshot(void)
 
 end:
     IFile_Close(&file);
+
+    if (archive != 0)
+        FSUSER_CloseArchive(archive);
 
     if (R_FAILED(Draw_AllocateFramebufferCache(FB_BOTTOM_SIZE)))
         __builtin_trap(); // We're f***ed if this happens
@@ -354,6 +399,91 @@ end:
         Draw_Unlock();
     }
     while(!(waitInput() & KEY_B) && !menuShouldExit);
+}
+
+static Result menuWriteSelfScreenshot(IFile *file)
+{
+    u64 total;
+    Result res = 0;
+
+    u32 width = 320;
+    u32 lineSize = 3 * width;
+
+    u32 scaleFactorY = 1;
+    u32 numLinesScaled = 240 * scaleFactorY;
+
+    u32 addr = 0x0D800000; // keep this in check
+    u32 tmp;
+
+    u32 size = ((54 + lineSize * numLinesScaled * scaleFactorY) + 0xFFF) >> 12 << 12; // round-up
+    u8 *buffer = NULL;
+
+    TRY(svcControlMemoryEx(&tmp, addr, 0, size, MEMOP_ALLOC | MEMOP_REGION_SYSTEM, MEMPERM_READWRITE, true));
+    buffer = (u8 *)addr;
+
+    Draw_CreateBitmapHeader(buffer, width, numLinesScaled);
+
+    Draw_ConvertFrameBufferLines(buffer + 54, width, 0, numLinesScaled, scaleFactorY, false, false);
+    TRY(IFile_Write(file, &total, buffer, 54 + lineSize * numLinesScaled * scaleFactorY, 0)); // don't forget to write the header
+
+end:
+    if (buffer)
+        svcControlMemoryEx(&tmp, addr, 0, size, MEMOP_FREE, MEMPERM_DONTCARE, false);
+
+    return res;
+}
+
+void menuTakeSelfScreenshot(void)
+{
+    // Optimized for N3DS. May fail due to OOM.
+
+    IFile file = {0};
+    Result res = 0;
+
+    char filename[100];
+    char dateTimeStr[64];
+
+    FS_Archive archive;
+    FS_ArchiveID archiveId;
+    s64 out;
+    bool isSdMode;
+
+    timeSpentConvertingScreenshot = 0;
+    timeSpentWritingScreenshot = 0;
+
+    if(R_FAILED(svcGetSystemInfo(&out, 0x10000, 0x203))) svcBreak(USERBREAK_ASSERT);
+    isSdMode = (bool)out;
+
+    archiveId = isSdMode ? ARCHIVE_SDMC : ARCHIVE_NAND_RW;
+    Draw_Lock();
+    svcFlushEntireDataCache();
+
+    res = FSUSER_OpenArchive(&archive, archiveId, fsMakePath(PATH_EMPTY, ""));
+    if(R_SUCCEEDED(res))
+    {
+        res = FSUSER_CreateDirectory(archive, fsMakePath(PATH_ASCII, "/luma/screenshots"), 0);
+        if((u32)res == 0xC82044BE) // directory already exists
+            res = 0;
+        FSUSER_CloseArchive(archive);
+    }
+    else
+    {
+        archive = 0;
+        goto end;
+    }
+
+    dateTimeToString(dateTimeStr, osGetTime(), true);
+
+    sprintf(filename, "/luma/screenshots/rosalina_menu_%s.bmp", dateTimeStr);
+
+    TRY(IFile_Open(&file, archiveId, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, filename), FS_OPEN_CREATE | FS_OPEN_WRITE));
+    TRY(menuWriteSelfScreenshot(&file));
+
+end:
+    IFile_Close(&file);
+
+    if (archive != 0)
+        FSUSER_CloseArchive(archive);
+}
 
 #undef TRY
-}
